@@ -1,0 +1,264 @@
+---
+title: "US Groundwater Stable Isotopes Data"
+output:
+  html_notebook: default
+  pdf_document: default
+---
+
+# Overview
+1. Generate a map of stable water isotopes in shallow groundwater across the US
+    i) Summarize broad spatial patterns
+    ii) Look for outliers and areas of notable anomolies.  Do these reveal something about the hydrology?
+2. Create boxplot of d^2^H for each state
+3. Create scatter plot of d^18^O vs. d^2^H (with state as factor)
+4. Identify wells with time-series data and map just these locations
+    i) Test for time trends at each of these sites
+    ii) Identify if locations with time trends have notable features (e.g. in area of intensive groundwater pumping)
+
+## Key points
++ Here I present the first map of groundwater stable isotope patterns across the United States
++ Map highlights patterns and variability in groundwater stable isotopes across regions
++ Provides key data for interpreting recharge timing of groundwater
++ Provides data useful to interpretation of stream hydrology and particularly the expected isotopic signature baseflow
++ Useful baseline information for comparing future shifts in groundwater isotopes that may suggest changes to recharge timining and source
++ Expected groundwater conditions allow for the identification of anomolous locations, which may signal the possibility of anthropengic impact to groundwater recharge that result in deviation from local conditions.  Useful tool for water resource practitioners and researchers for identifying areas that may benefit from future hydrologic investigation.
++ Trends in locations with long-term records reveal...
+
+
+Note: https://wci.earth2observe.eu/portal/ (allows for access to gridded output for many global hydrologic models and gridded output for many hydrologic datasets)
+
+Note: http://wateriso.utah.edu/waterisotopes/pages/data_access/ArcGrids.html (has gridded isotope data for precipitation and USA river water)
+
+Note: See https://www.cuahsi.org/data-models/portals/P30 for other data resources
+
+## Attach required packages 
+```{r}
+library(dataRetrieval)
+library(ggplot2)
+library(plotly)
+library(dplyr)
+library(cdlTools)
+
+```
+
+## Define search criteria for data retrevial  
+```{r}
+
+# 00095 is Sp.C and 00010 is temp in C (USGS parameter codes)
+
+param_list = c("82085","82082") #USGS parameter codes to use in data retrevial search
+site_type = "GW" # type of site (e.g. groundwater, stream,...) to use in search
+well_max_depth = 100 # maximum well depth in feet (applies to groundwater searches)
+
+state_list <- c("AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SC","TN","TX","UT","VT","VA","WA","WV","WI","WY") # list of states to include in search query
+
+```
+
+
+## Define a function to download NWIS site list and handle errors for states that don't have dat
+```{r}
+readUrl <- function(i) {
+    state_sites <- tryCatch(
+        {
+            print(i)
+            state_sites <- whatNWISdata(stateCd=i, siteType=site_type, parameterCd = param_list, WellDepthMax = well_max_depth) %>% select(site_no) # get NWIS site information for sites that meet specified criteria
+            
+        },
+        
+        # error handling (if a download error occurs then skip the state that generates the error)
+        error=function(cond) {
+            message(paste("Data for the following state does not exist:", i))
+            message("Here's the original error message:")
+            message(cond)
+            # Choose a return value in case of error
+            state_sites <- data.frame()
+        },
+        
+        # error handling (if a download warning occurs then skip the state that generates the error
+        warning=function(cond) {
+            message(paste("The following state caused a warning:", i))
+            message("Here's the original warning message:")
+            message(cond)
+            # Choose a return value in case of warning
+            state_sites <- data.frame()
+        },
+        finally={
+            message(paste("Processed state:", i))
+        }
+    )    
+    return(state_sites)
+}
+```
+
+
+## Find sites meeting search critera (get site list)
+```{r}
+all_sites <- data.frame()
+
+# loop over all of states in state_list and call the function readUrl to get the site info for sites meeting 
+for(i in state_list){
+ state_sites <- readUrl(i)  # call readUrl function
+ 
+ # if there are sites meeting search criteria for the currently evaluated state then add these sites to the list containing all sites meeting the search criteria
+ if(dim(state_sites)[1] > 0){
+   all_sites <- bind_rows(all_sites,state_sites)
+ }
+}
+
+site_no_list = unique(all_sites$site_no) # list of unique site numbers
+```
+
+## Download data for all of the selected sites
+```{r}
+# Read the data for all of the sites that matched my search criteria
+all_data = readNWISqw(siteNumbers = site_no_list,parameterCd = param_list,reshape = TRUE) %>% filter(!is.na(result_va_82085) & !is.na(result_va_82082)) # filter so that I only get data for sites that have both isotopes
+
+# add a column site attributes to the all_data dataframe
+site_index = match(all_data$site_no,attr(all_data,"siteInfo")$site_no)
+
+all_data$state_cd = attr(all_data,"siteInfo")$state_cd[site_index] # add a column with the state code
+all_data$dec_lat_va = attr(all_data,"siteInfo")$dec_lat_va[site_index] # add a column withe the latitude
+all_data$dec_long_va = attr(all_data,"siteInfo")$dec_long_va[site_index]  # add a column with  the longitude
+all_data$well_depth = attr(all_data,"siteInfo")$well_depth_va[site_index]  # add a column with the well depth (ft)
+all_data$state_abbrev = fips(all_data$state_cd,to ='Abbreviation') # add a column with the state abbreviation
+```
+
+## Create a data frame with locations that have time-series data meeting specified criteria
+```{r}
+num_meas = 2 # number of measurements
+min_t_range = 5 # minumum time difference between first and last measurement (years)
+all_data$n_measurements <- -9999 # initialize a column to hold the number of measurements taken at each site
+all_data$time_window <- 9999 # initialize column with time between earliest and most recent sample collected at each site
+all_data$d2h_avg <- -9999
+all_data$d18O_avg <- -9999
+all_data$d2h_excess_avg <- -9999
+
+#d2h_excess <- all_data$result_va_82082 - (all_data$result_va_82085*8 ) # deuterium excess
+all_data$d2h_excess <- all_data$result_va_82082 - (all_data$result_va_82085*8 ) # deuterium excess
+
+for(i_site in site_no_list){
+  temp_count <- sum(all_data$site_no == i_site) # number of measurements at i_site
+  temp_window <- max(all_data$sample_dt[(all_data$site_no == i_site)]) - min(all_data$sample_dt[(all_data$site_no == i_site)])
+  
+  all_data$n_measurements[all_data$site_no == i_site] <- temp_count # assign the number of measurements at site_i to the rows with site_i data
+  all_data$time_window[all_data$site_no == i_site] <- temp_window # length of time (days) between earliest and most recent sample collected at each site
+  
+  all_data$d2h_avg[all_data$site_no == i_site] <- mean(all_data$result_va_82082[all_data$site_no == i_site])
+  all_data$d18O_avg[all_data$site_no == i_site] <- mean(all_data$result_va_82085[all_data$site_no == i_site])
+  all_data$d2h_excess_avg[all_data$site_no == i_site] <- mean(all_data$d2h_excess[all_data$site_no == i_site])
+}
+
+time_series_data <- filter(all_data,n_measurements >= num_meas) %>% filter(time_window > min_t_range*365)
+
+```
+
+## Make some plots
+```{r}
+library(plotly)
+
+## Create a box plot that has d^2^h data by state
+p <- ggplot(all_data,aes(x = state_abbrev, y = result_va_82082)) + geom_boxplot() + labs(y = "d^2^H")
+p<- ggplotly(p) # make figure an interactive plotly figure
+htmlwidgets::saveWidget(as_widget(p), "GW_Isotope_State_BoxPlot.html") # save the figure as an html file
+
+## Create an scatter plot of d^2^H vs. d^18^O with the points color-coded by state
+p<- ggplot(all_data,aes(result_va_82085,result_va_82082,color = state_abbrev)) + geom_point() + labs(x="d^18^O",y="d^2^H")
+p<- ggplotly(p)
+htmlwidgets::saveWidget(as_widget(p), "GW_d2Hvsd18O.html")
+
+## Create a scatter plot of d^2^H vs. latitude
+p<- ggplot(all_data,aes(dec_lat_va,result_va_82082,color = state_abbrev)) + geom_point() + labs(x="Latitude",y="d^2^H")
+p<- ggplotly(p)
+htmlwidgets::saveWidget(as_widget(p), "GW_d2HvsLatitude.html")
+
+## Create a scatter plot of d^2^H vs. longitude
+p<- ggplot(all_data,aes(dec_long_va,result_va_82082,color = state_abbrev)) + geom_point() + labs(x="Longitude",y="d^2^H")
+p<- ggplotly(p)
+htmlwidgets::saveWidget(as_widget(p), "GW_d2HvsLongitude.html")
+
+## Create a scatter plot of d^2^H vs. well depth
+p<- ggplot(all_data,aes(well_depth,result_va_82082,color = state_abbrev)) + geom_point() + labs(x="Well depth (ft)",y="d^2^H")
+p<- ggplotly(p)
+htmlwidgets::saveWidget(as_widget(p), "GW_d2HvsWellDepth.html")
+
+```
+
+## Map 1 (Wells color coded by d^2^H)
+```{r}
+
+all_data$symb_sizes <- 10 + all_data$well_depth/10000 
+
+g <- list(
+  scope = 'usa',
+  projection = list(type = 'albers usa'),
+  showland = TRUE,
+  landcolor = toRGB("gray85"),
+  subunitwidth = 1,
+  countrywidth = 1,
+  subunitcolor = toRGB("white"),
+  countrycolor = toRGB("white")
+)
+
+p<- plot_geo(all_data, locationmode = 'USA-states', sizes = c(99.99, 100)) %>%
+  add_markers(
+    x = ~dec_long_va, y = ~dec_lat_va,size =~symb_sizes, color = ~d2h_avg, hoverinfo = "text",
+    text = ~paste(all_data$d2h_avg, "d2H (permil) <br />", all_data$d18O_avg, "d18O (permil)","<br />",all_data$d2h_excess_avg, "d2H excess (permil) <br />",all_data$well_depth,"Well Depth (ft BLS)")
+  ) %>%
+  layout(title = 'Groundwater Stable Water Isotopes', geo = g)
+
+#ggplotly(p)
+htmlwidgets::saveWidget(as_widget(p), "GW_Isotope_Map.html")
+```
+
+## Map 2 ()
+```{r}
+#
+#g <- list(
+#  scope = 'usa',
+#  projection = list(type = 'albers usa'),
+#  showland = TRUE,
+#  landcolor = toRGB("gray85"),
+#  subunitwidth = 1,
+#  countrywidth = 1,
+#  subunitcolor = toRGB("white"),
+#  countrycolor = toRGB("white")
+#)
+#
+#p<- plot_geo(all_data, lat = ~dec_lat_va, lon = ~dec_long_va, color = ~result_va_82082) %>%
+#  add_markers(
+#    text = ~paste(all_data$result_va_82082, "d2H per mil <br />", all_data$result_va_82085, "d18O per mil <br #/>",all_data$well_depth," (ft BLS)")
+#  ) %>%
+#  layout(title = 'GW Isotopes', geo = g)
+#
+#htmlwidgets::saveWidget(as_widget(p), "GW_Isotope_Map_v2.html")
+```
+
+## Map 3
+```{r}
+
+#g <- list(
+#  scope = 'usa',
+#  projection = list(type = 'albers usa'),
+#  showland = TRUE,
+#  landcolor = toRGB("gray85"),
+#  subunitwidth = 1,
+#  countrywidth = 1,
+#  subunitcolor = toRGB("white"),
+#  countrycolor = toRGB("white")
+#)
+#
+#p<- plot_geo(all_data, locationmode = 'USA-states', sizes = c(100, 150)) %>%
+#  add_markers(
+#    x = ~dec_long_va, y = ~dec_lat_va, size = ~d2h_dev, hoverinfo = "text",
+#    text = ~paste(all_data$result_va_82082, " d2H permil <br />", all_data$result_va_82085, "d18O per mil","<br />",all_data$well_depth," #(ft BLS)")
+#  ) %>%
+#  layout(title = 'GW Isotopes (deuterium excess)', geo = g)
+#
+#htmlwidgets::saveWidget(as.widget(p), "GW_Isotope_Map_v3.html")
+```
+```{r}
+p <- ggplot(all_data,aes(x = state_abbrev, y = d2h_excess)) + geom_boxplot() + labs(y = "deuterium excess")
+p<- ggplotly(p)
+htmlwidgets::saveWidget(as.widget(p), "GW_Isotope_State_BoxPlot_d2h_deviations.html")
+```
+
